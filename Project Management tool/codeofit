@@ -1,0 +1,1016 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, signOut } from 'firebase/auth';
+import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where, arrayUnion, arrayRemove, serverTimestamp } from 'firebase/firestore';
+import { Plus, Users, LayoutDashboard, MessageSquare, User, Clock, CheckCircle, CircleDot, XCircle, Bell, Eye, EyeOff } from 'lucide-react';
+
+// Ensure __app_id, __firebase_config, and __initial_auth_token are defined in the environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+// Global Message Component (for success/error notifications)
+const Message = ({ message }) => {
+    if (!message.text) return null;
+    return (
+        <div className={`fixed bottom-4 left-1/2 -translate-x-1/2 p-4 rounded-lg shadow-lg z-50 transition-opacity duration-300
+            ${message.type === 'error' ? 'bg-red-500 text-white' : 'bg-green-500 text-white'}`}>
+            {message.text}
+        </div>
+    );
+};
+
+// Main App Component
+const App = () => {
+    const [currentUser, setCurrentUser] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [users, setUsers] = useState({}); // Stores all user data for lookup
+    const [showLogin, setShowLogin] = useState(true);
+    const [username, setUsername] = useState('');
+    const [projects, setProjects] = useState([]);
+    const [activeProject, setActiveProject] = useState(null); // Currently viewed project
+    const [tasks, setTasks] = useState([]); // Tasks for the active project
+    const [comments, setComments] = useState([]); // Comments for the active task
+    const [notifications, setNotifications] = useState([]);
+    const [showNotifications, setShowNotifications] = useState(false);
+
+    // Modals state
+    const [showCreateProjectModal, setShowCreateProjectModal] = useState(false);
+    const [showCreateTaskModal, setShowCreateTaskModal] = useState(false);
+    const [showTaskDetailModal, setShowTaskDetailModal] = useState(false);
+    const [selectedTask, setSelectedTask] = useState(null);
+    const [showInviteMemberModal, setShowInviteMemberModal] = useState(false);
+
+    // Message state
+    const [message, setMessage] = useState({ text: '', type: '' });
+    const showMessage = (text, type) => {
+        setMessage({ text, type });
+        setTimeout(() => setMessage({ text: '', type: '' }), 5000);
+    };
+
+    // Firebase Authentication Listener
+    useEffect(() => {
+        const unsubscribe = onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                setCurrentUser(user);
+                setShowLogin(false);
+                const userDocRef = doc(db, `artifacts/${appId}/public/data/users`, user.uid);
+                const userDocSnap = await getDoc(userDocRef);
+                if (!userDocSnap.exists()) {
+                    const defaultUsername = `user_${user.uid.substring(0, 6)}`;
+                    await setDoc(userDocRef, {
+                        uid: user.uid,
+                        username: defaultUsername,
+                        email: user.email || '',
+                        profilePicUrl: `https://placehold.co/40x40/A78BFA/ffffff?text=${defaultUsername.charAt(0).toUpperCase()}`,
+                        projects: []
+                    });
+                    setUsername(defaultUsername);
+                } else {
+                    setUsername(userDocSnap.data().username);
+                }
+            } else {
+                setCurrentUser(null);
+                setShowLogin(true);
+            }
+            setIsAuthReady(true);
+        });
+
+        const authenticate = async () => {
+            try {
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Authentication error:", error);
+                showMessage("Authentication failed. Please try again.", "error");
+            }
+        };
+
+        if (!isAuthReady) {
+            authenticate();
+        }
+        return () => unsubscribe();
+    }, [isAuthReady]);
+
+    // Fetch all users (for assigning tasks, inviting members)
+    useEffect(() => {
+        if (!db || !isAuthReady) return;
+        const usersColRef = collection(db, `artifacts/${appId}/public/data/users`);
+        const unsubscribe = onSnapshot(usersColRef, (snapshot) => {
+            const usersData = {};
+            snapshot.forEach(doc => {
+                usersData[doc.id] = doc.data();
+            });
+            setUsers(usersData);
+        }, (error) => {
+            console.error("Error fetching users:", error);
+            showMessage("Error loading user data.", "error");
+        });
+        return () => unsubscribe();
+    }, [db, isAuthReady]);
+
+    // Fetch projects for the current user
+    useEffect(() => {
+        if (!db || !currentUser) return;
+
+        // Listen to the current user's document for project memberships
+        const userDocRef = doc(db, `artifacts/${appId}/public/data/users`, currentUser.uid);
+        const unsubscribeUserProjects = onSnapshot(userDocRef, async (userSnap) => {
+            if (userSnap.exists()) {
+                const userProjects = userSnap.data().projects || [];
+                if (userProjects.length === 0) {
+                    setProjects([]);
+                    return;
+                }
+
+                // Fetch project details for each project ID the user is a member of
+                const projectPromises = userProjects.map(projectId =>
+                    getDoc(doc(db, `artifacts/${appId}/public/data/projects`, projectId))
+                );
+
+                try {
+                    const projectDocs = await Promise.all(projectPromises);
+                    const fetchedProjects = projectDocs.filter(docSnap => docSnap.exists()).map(docSnap => ({
+                        id: docSnap.id,
+                        ...docSnap.data()
+                    }));
+                    setProjects(fetchedProjects);
+                } catch (error) {
+                    console.error("Error fetching project details:", error);
+                    showMessage("Error loading project details.", "error");
+                }
+            } else {
+                setProjects([]);
+            }
+        }, (error) => {
+            console.error("Error listening to user projects:", error);
+            showMessage("Error syncing user projects.", "error");
+        });
+
+        return () => unsubscribeUserProjects();
+    }, [db, currentUser]);
+
+    // Fetch tasks for the active project
+    useEffect(() => {
+        if (!db || !activeProject) {
+            setTasks([]);
+            return;
+        }
+        const tasksColRef = collection(db, `artifacts/${appId}/public/data/tasks`);
+        const q = query(tasksColRef, where('projectId', '==', activeProject.id));
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const fetchedTasks = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            })).sort((a, b) => a.createdAt?.toDate() - b.createdAt?.toDate());
+            setTasks(fetchedTasks);
+        }, (error) => {
+            console.error("Error fetching tasks:", error);
+            showMessage("Error loading tasks.", "error");
+        });
+        return () => unsubscribe();
+    }, [db, activeProject]);
+
+    // Fetch comments for the selected task
+    useEffect(() => {
+        if (!db || !selectedTask) {
+            setComments([]);
+            return;
+        }
+        const commentsColRef = collection(db, `artifacts/${appId}/public/data/comments`);
+        const q = query(commentsColRef, where('taskId', '==', selectedTask.id));
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const fetchedComments = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            })).sort((a, b) => a.createdAt?.toDate() - b.createdAt?.toDate());
+            setComments(fetchedComments);
+        }, (error) => {
+            console.error("Error fetching comments:", error);
+            showMessage("Error loading comments.", "error");
+        });
+        return () => unsubscribe();
+    }, [db, selectedTask]);
+
+    // Fetch notifications for the current user
+    useEffect(() => {
+        if (!db || !currentUser) {
+            setNotifications([]);
+            return;
+        }
+        const notificationsColRef = collection(db, `artifacts/${appId}/public/data/notifications`);
+        const q = query(notificationsColRef, where('userId', '==', currentUser.uid));
+        const unsubscribe = onSnapshot(q, (snapshot) => {
+            const fetchedNotifications = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            })).sort((a, b) => b.createdAt?.toDate() - a.createdAt?.toDate());
+            setNotifications(fetchedNotifications);
+        }, (error) => {
+            console.error("Error fetching notifications:", error);
+            showMessage("Error loading notifications.", "error");
+        });
+        return () => unsubscribe();
+    }, [db, currentUser]);
+
+
+    const handleLoginRegister = async () => {
+        if (!username.trim()) {
+            showMessage("Please enter a username.", "error");
+            return;
+        }
+        try {
+            if (currentUser) {
+                const userDocRef = doc(db, `artifacts/${appId}/public/data/users`, currentUser.uid);
+                await updateDoc(userDocRef, { username: username.trim() });
+                showMessage("Username updated successfully!", "success");
+                setShowLogin(false);
+                return;
+            }
+            await signInAnonymously(auth);
+        } catch (error) {
+            console.error("Error during login/registration:", error);
+            showMessage("Failed to login/register. Please try again.", "error");
+        }
+    };
+
+    const handleLogout = async () => {
+        try {
+            await signOut(auth);
+            setCurrentUser(null);
+            setShowLogin(true);
+            setUsername('');
+            setActiveProject(null);
+            setTasks([]);
+            setComments([]);
+            setNotifications([]);
+            showMessage("Logged out successfully!", "success");
+        } catch (error) {
+            console.error("Error logging out:", error);
+            showMessage("Failed to log out. Please try again.", "error");
+        }
+    };
+
+    const handleCreateProject = async (projectName, projectDescription) => {
+        if (!projectName.trim()) {
+            showMessage("Project name cannot be empty.", "error");
+            return;
+        }
+        if (!currentUser) {
+            showMessage("You must be logged in to create a project.", "error");
+            return;
+        }
+        try {
+            const projectsColRef = collection(db, `artifacts/${appId}/public/data/projects`);
+            const newProjectRef = await addDoc(projectsColRef, {
+                name: projectName.trim(),
+                description: projectDescription.trim(),
+                createdAt: serverTimestamp(),
+                createdBy: currentUser.uid,
+                members: [currentUser.uid] // Creator is automatically a member
+            });
+
+            // Add project to creator's user document
+            const userDocRef = doc(db, `artifacts/${appId}/public/data/users`, currentUser.uid);
+            await updateDoc(userDocRef, {
+                projects: arrayUnion(newProjectRef.id)
+            });
+
+            showMessage("Project created successfully!", "success");
+            setShowCreateProjectModal(false);
+        } catch (error) {
+            console.error("Error creating project:", error);
+            showMessage("Failed to create project. Please try again.", "error");
+        }
+    };
+
+    const handleCreateTask = async (taskTitle, taskDescription, assignedToId, dueDate) => {
+        if (!taskTitle.trim()) {
+            showMessage("Task title cannot be empty.", "error");
+            return;
+        }
+        if (!activeProject) {
+            showMessage("Select a project first.", "error");
+            return;
+        }
+        if (!currentUser) {
+            showMessage("You must be logged in to create a task.", "error");
+            return;
+        }
+
+        try {
+            const tasksColRef = collection(db, `artifacts/${appId}/public/data/tasks`);
+            const newTaskRef = await addDoc(tasksColRef, {
+                projectId: activeProject.id,
+                title: taskTitle.trim(),
+                description: taskDescription.trim(),
+                status: 'todo',
+                assignedTo: assignedToId || null,
+                createdBy: currentUser.uid,
+                createdAt: serverTimestamp(),
+                dueDate: dueDate ? new Date(dueDate) : null
+            });
+
+            // Create notification if assigned to someone else
+            if (assignedToId && assignedToId !== currentUser.uid) {
+                const notificationsColRef = collection(db, `artifacts/${appId}/public/data/notifications`);
+                await addDoc(notificationsColRef, {
+                    userId: assignedToId,
+                    type: 'task_assigned',
+                    message: `You were assigned to task "${taskTitle}" in project "${activeProject.name}".`,
+                    link: `/project/${activeProject.id}/task/${newTaskRef.id}`, // Placeholder link
+                    read: false,
+                    createdAt: serverTimestamp()
+                });
+            }
+
+            showMessage("Task created successfully!", "success");
+            setShowCreateTaskModal(false);
+        } catch (error) {
+            console.error("Error creating task:", error);
+            showMessage("Failed to create task. Please try again.", "error");
+        }
+    };
+
+    const handleUpdateTaskStatus = async (taskId, newStatus) => {
+        try {
+            const taskRef = doc(db, `artifacts/${appId}/public/data/tasks`, taskId);
+            await updateDoc(taskRef, { status: newStatus });
+            showMessage("Task status updated!", "success");
+        } catch (error) {
+            console.error("Error updating task status:", error);
+            showMessage("Failed to update task status.", "error");
+        }
+    };
+
+    const handleAddComment = async (taskId, commentText) => {
+        if (!commentText.trim()) {
+            showMessage("Comment cannot be empty.", "error");
+            return;
+        }
+        if (!currentUser) {
+            showMessage("You must be logged in to comment.", "error");
+            return;
+        }
+        try {
+            const commentsColRef = collection(db, `artifacts/${appId}/public/data/comments`);
+            await addDoc(commentsColRef, {
+                taskId: taskId,
+                userId: currentUser.uid,
+                username: users[currentUser.uid]?.username || 'Anonymous',
+                text: commentText.trim(),
+                createdAt: serverTimestamp(),
+            });
+
+            // Create notification for other members of the task's project
+            const taskDoc = tasks.find(t => t.id === taskId);
+            if (taskDoc && activeProject) {
+                const projectMembers = activeProject.members || [];
+                const usersToNotify = projectMembers.filter(memberId => memberId !== currentUser.uid);
+
+                for (const memberId of usersToNotify) {
+                    const notificationsColRef = collection(db, `artifacts/${appId}/public/data/notifications`);
+                    await addDoc(notificationsColRef, {
+                        userId: memberId,
+                        type: 'new_comment',
+                        message: `${users[currentUser.uid]?.username || 'Someone'} commented on task "${taskDoc.title}" in project "${activeProject.name}".`,
+                        link: `/project/${activeProject.id}/task/${taskId}`, // Placeholder link
+                        read: false,
+                        createdAt: serverTimestamp()
+                    });
+                }
+            }
+
+            showMessage("Comment added!", "success");
+            // No need to clear comment text here, it's handled by modal state
+        } catch (error) {
+            console.error("Error adding comment:", error);
+            showMessage("Failed to add comment. Please try again.", "error");
+        }
+    };
+
+    const handleInviteMember = async (projectId, invitedUserId) => {
+        if (!projectId || !invitedUserId) {
+            showMessage("Invalid project or user ID.", "error");
+            return;
+        }
+        if (!currentUser) {
+            showMessage("You must be logged in to invite members.", "error");
+            return;
+        }
+        if (activeProject.members.includes(invitedUserId)) {
+            showMessage("User is already a member of this project.", "error");
+            return;
+        }
+
+        try {
+            const projectRef = doc(db, `artifacts/${appId}/public/data/projects`, projectId);
+            await updateDoc(projectRef, {
+                members: arrayUnion(invitedUserId)
+            });
+
+            const invitedUserRef = doc(db, `artifacts/${appId}/public/data/users`, invitedUserId);
+            await updateDoc(invitedUserRef, {
+                projects: arrayUnion(projectId)
+            });
+
+            // Create notification for the invited user
+            const notificationsColRef = collection(db, `artifacts/${appId}/public/data/notifications`);
+            await addDoc(notificationsColRef, {
+                userId: invitedUserId,
+                type: 'project_invite',
+                message: `You were invited to project "${activeProject.name}" by ${users[currentUser.uid]?.username || 'someone'}.`,
+                link: `/project/${projectId}`, // Placeholder link
+                read: false,
+                createdAt: serverTimestamp()
+            });
+
+            showMessage(`${users[invitedUserId]?.username || 'User'} invited successfully!`, "success");
+            setShowInviteMemberModal(false);
+        } catch (error) {
+            console.error("Error inviting member:", error);
+            showMessage("Failed to invite member. Please try again.", "error");
+        }
+    };
+
+    const handleMarkNotificationRead = async (notificationId) => {
+        try {
+            const notificationRef = doc(db, `artifacts/${appId}/public/data/notifications`, notificationId);
+            await updateDoc(notificationRef, { read: true });
+        } catch (error) {
+            console.error("Error marking notification as read:", error);
+        }
+    };
+
+    const handleMarkAllNotificationsRead = async () => {
+        const unreadNotifications = notifications.filter(n => !n.read);
+        try {
+            for (const notif of unreadNotifications) {
+                const notificationRef = doc(db, `artifacts/${appId}/public/data/notifications`, notif.id);
+                await updateDoc(notificationRef, { read: true });
+            }
+            showMessage("All notifications marked as read.", "success");
+        } catch (error) {
+            console.error("Error marking all notifications as read:", error);
+            showMessage("Failed to mark all notifications as read.", "error");
+        }
+    };
+
+    const unreadNotificationCount = notifications.filter(n => !n.read).length;
+
+    // Modals
+    const CreateProjectModal = ({ onClose, onCreate }) => {
+        const [name, setName] = useState('');
+        const [description, setDescription] = useState('');
+        return (
+            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 relative">
+                    <button onClick={onClose} className="absolute top-4 right-4 text-gray-500 hover:text-gray-800 text-2xl font-bold">&times;</button>
+                    <h3 className="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Create New Project</h3>
+                    <input
+                        type="text"
+                        placeholder="Project Name"
+                        className="w-full p-3 border border-gray-300 rounded-lg mb-3 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        value={name}
+                        onChange={(e) => setName(e.target.value)}
+                    />
+                    <textarea
+                        placeholder="Project Description (optional)"
+                        className="w-full p-3 border border-gray-300 rounded-lg mb-4 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        rows="3"
+                        value={description}
+                        onChange={(e) => setDescription(e.target.value)}
+                    ></textarea>
+                    <button
+                        onClick={() => onCreate(name, description)}
+                        className="w-full bg-purple-600 text-white py-3 rounded-lg hover:bg-purple-700 transition duration-300 ease-in-out transform hover:scale-105"
+                    >
+                        Create Project
+                    </button>
+                </div>
+            </div>
+        );
+    };
+
+    const CreateTaskModal = ({ onClose, onCreate, projectMembers }) => {
+        const [title, setTitle] = useState('');
+        const [description, setDescription] = useState('');
+        const [assignedTo, setAssignedTo] = useState(''); // User ID
+        const [dueDate, setDueDate] = useState('');
+
+        return (
+            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 relative">
+                    <button onClick={onClose} className="absolute top-4 right-4 text-gray-500 hover:text-gray-800 text-2xl font-bold">&times;</button>
+                    <h3 className="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Create New Task</h3>
+                    <input
+                        type="text"
+                        placeholder="Task Title"
+                        className="w-full p-3 border border-gray-300 rounded-lg mb-3 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        value={title}
+                        onChange={(e) => setTitle(e.target.value)}
+                    />
+                    <textarea
+                        placeholder="Task Description (optional)"
+                        className="w-full p-3 border border-gray-300 rounded-lg mb-3 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        rows="3"
+                        value={description}
+                        onChange={(e) => setDescription(e.target.value)}
+                    ></textarea>
+                    <select
+                        className="w-full p-3 border border-gray-300 rounded-lg mb-3 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        value={assignedTo}
+                        onChange={(e) => setAssignedTo(e.target.value)}
+                    >
+                        <option value="">Assign To (Optional)</option>
+                        {projectMembers.map(memberId => (
+                            <option key={memberId} value={memberId}>
+                                {users[memberId]?.username || 'Unknown User'}
+                            </option>
+                        ))}
+                    </select>
+                    <input
+                        type="date"
+                        className="w-full p-3 border border-gray-300 rounded-lg mb-4 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        value={dueDate}
+                        onChange={(e) => setDueDate(e.target.value)}
+                    />
+                    <button
+                        onClick={() => onCreate(title, description, assignedTo, dueDate)}
+                        className="w-full bg-purple-600 text-white py-3 rounded-lg hover:bg-purple-700 transition duration-300 ease-in-out transform hover:scale-105"
+                    >
+                        Create Task
+                    </button>
+                </div>
+            </div>
+        );
+    };
+
+    const TaskDetailModal = ({ task, onClose, onAddComment, onUpdateStatus }) => {
+        const [currentCommentText, setCurrentCommentText] = useState('');
+        const assignedUser = users[task.assignedTo];
+
+        const getStatusIcon = (status) => {
+            switch (status) {
+                case 'todo': return <CircleDot className="text-gray-500" size={18} />;
+                case 'in-progress': return <Clock className="text-blue-500" size={18} />;
+                case 'done': return <CheckCircle className="text-green-500" size={18} />;
+                default: return null;
+            }
+        };
+
+        return (
+            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl p-6 relative flex flex-col max-h-[90vh]">
+                    <button onClick={onClose} className="absolute top-4 right-4 text-gray-500 hover:text-gray-800 text-2xl font-bold">&times;</button>
+                    <h3 className="text-3xl font-bold text-gray-800 mb-4 border-b pb-2">{task.title}</h3>
+
+                    <div className="grid grid-cols-2 gap-4 text-gray-600 mb-4">
+                        <p className="flex items-center"><User size={16} className="mr-2" /> Assigned To: {assignedUser ? assignedUser.username : 'Unassigned'}</p>
+                        <p className="flex items-center">{getStatusIcon(task.status)} <span className="ml-2">Status: {task.status.replace('-', ' ').toUpperCase()}</span></p>
+                        {task.dueDate && <p className="flex items-center"><Clock size={16} className="mr-2" /> Due Date: {new Date(task.dueDate.toDate()).toLocaleDateString()}</p>}
+                        <p className="flex items-center"><Plus size={16} className="mr-2" /> Created By: {users[task.createdBy]?.username || 'Unknown'}</p>
+                        <p className="flex items-center"><Clock size={16} className="mr-2" /> Created At: {new Date(task.createdAt?.toDate()).toLocaleString()}</p>
+                    </div>
+
+                    <p className="text-gray-700 text-lg mb-6 p-4 bg-gray-50 rounded-lg border border-gray-200">{task.description || 'No description provided.'}</p>
+
+                    {/* Status Update Buttons */}
+                    <div className="flex justify-center space-x-4 mb-6">
+                        <button
+                            onClick={() => onUpdateStatus(task.id, 'todo')}
+                            className={`px-4 py-2 rounded-full text-sm font-semibold transition duration-200 ${task.status === 'todo' ? 'bg-gray-500 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'}`}
+                        >
+                            To Do
+                        </button>
+                        <button
+                            onClick={() => onUpdateStatus(task.id, 'in-progress')}
+                            className={`px-4 py-2 rounded-full text-sm font-semibold transition duration-200 ${task.status === 'in-progress' ? 'bg-blue-500 text-white' : 'bg-blue-200 text-blue-700 hover:bg-blue-300'}`}
+                        >
+                            In Progress
+                        </button>
+                        <button
+                            onClick={() => onUpdateStatus(task.id, 'done')}
+                            className={`px-4 py-2 rounded-full text-sm font-semibold transition duration-200 ${task.status === 'done' ? 'bg-green-500 text-white' : 'bg-green-200 text-green-700 hover:bg-green-300'}`}
+                        >
+                            Done
+                        </button>
+                    </div>
+
+                    <h4 className="text-xl font-bold text-gray-800 mb-3 border-t pt-4">Comments</h4>
+                    <div className="flex-grow overflow-y-auto mb-4 pr-2 custom-scrollbar">
+                        {comments.length === 0 ? (
+                            <p className="text-gray-600 text-center py-4">No comments yet. Be the first!</p>
+                        ) : (
+                            comments.map(comment => (
+                                <div key={comment.id} className="bg-gray-100 p-3 rounded-lg mb-3 border border-gray-200">
+                                    <p className="font-semibold text-gray-800">
+                                        {users[comment.userId]?.username || comment.username}
+                                        <span className="text-xs text-gray-500 ml-2">
+                                            {new Date(comment.createdAt?.toDate()).toLocaleString()}
+                                        </span>
+                                    </p>
+                                    <p className="text-gray-700 text-md mt-1">{comment.text}</p>
+                                </div>
+                            ))
+                        )}
+                    </div>
+
+                    <div className="mt-auto pt-4 border-t border-gray-200">
+                        <textarea
+                            className="w-full p-3 border border-gray-300 rounded-lg mb-3 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                            rows="2"
+                            placeholder="Add a comment..."
+                            value={currentCommentText}
+                            onChange={(e) => setCurrentCommentText(e.target.value)}
+                        ></textarea>
+                        <button
+                            onClick={() => { onAddComment(task.id, currentCommentText); setCurrentCommentText(''); }}
+                            className="w-full bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700 transition duration-300 ease-in-out transform hover:scale-105"
+                        >
+                            Add Comment
+                        </button>
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    const InviteMemberModal = ({ onClose, onInvite, projectMembers }) => {
+        const [invitedEmail, setInvitedEmail] = useState('');
+        const [foundUsers, setFoundUsers] = useState([]);
+        const [searchPerformed, setSearchPerformed] = useState(false);
+
+        const handleSearch = async () => {
+            setFoundUsers([]);
+            setSearchPerformed(true);
+            if (!invitedEmail.trim()) {
+                showMessage("Please enter an email to search.", "error");
+                return;
+            }
+            try {
+                // In a real app, you'd query by email. For this anonymous auth,
+                // we'll just search existing users by username (simulating email search)
+                // or just directly show all users not in the project.
+                const matchingUsers = Object.values(users).filter(user =>
+                    user.email === invitedEmail.trim() || user.username.toLowerCase().includes(invitedEmail.trim().toLowerCase())
+                );
+                setFoundUsers(matchingUsers);
+                if (matchingUsers.length === 0) {
+                    showMessage("No user found with that email/username.", "error");
+                }
+            } catch (error) {
+                console.error("Error searching users:", error);
+                showMessage("Error searching for users.", "error");
+            }
+        };
+
+        return (
+            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+                <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 relative">
+                    <button onClick={onClose} className="absolute top-4 right-4 text-gray-500 hover:text-gray-800 text-2xl font-bold">&times;</button>
+                    <h3 className="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Invite Member to {activeProject?.name}</h3>
+                    <div className="flex mb-4">
+                        <input
+                            type="text"
+                            placeholder="Search by username or email"
+                            className="flex-grow p-3 border border-gray-300 rounded-l-lg focus:outline-none focus:ring-2 focus:ring-purple-500"
+                            value={invitedEmail}
+                            onChange={(e) => { setInvitedEmail(e.target.value); setSearchPerformed(false); setFoundUsers([]); }}
+                        />
+                        <button
+                            onClick={handleSearch}
+                            className="bg-purple-600 text-white px-4 py-3 rounded-r-lg hover:bg-purple-700 transition duration-300 ease-in-out"
+                        >
+                            Search
+                        </button>
+                    </div>
+
+                    {searchPerformed && foundUsers.length > 0 && (
+                        <div className="mb-4 max-h-48 overflow-y-auto border border-gray-200 rounded-lg p-2">
+                            <p className="text-gray-600 text-sm mb-2">Search Results:</p>
+                            {foundUsers.map(user => (
+                                <div key={user.uid} className="flex items-center justify-between p-2 hover:bg-gray-50 rounded-md">
+                                    <span>{user.username} ({user.email || 'Anonymous'})</span>
+                                    {projectMembers.includes(user.uid) ? (
+                                        <span className="text-green-600 text-sm">Already Member</span>
+                                    ) : (
+                                        <button
+                                            onClick={() => onInvite(activeProject.id, user.uid)}
+                                            className="bg-blue-500 text-white px-3 py-1 rounded-full text-sm hover:bg-blue-600 transition duration-200"
+                                        >
+                                            Invite
+                                        </button>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    {searchPerformed && foundUsers.length === 0 && (
+                        <p className="text-gray-600 text-center py-4">No users found matching your search.</p>
+                    )}
+                </div>
+            </div>
+        );
+    };
+
+
+    if (!isAuthReady) {
+        return (
+            <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-purple-400 to-indigo-600">
+                <div className="bg-white p-8 rounded-lg shadow-xl text-center">
+                    <p className="text-xl font-semibold text-gray-800">Loading application...</p>
+                    <p className="text-gray-600 mt-2">Please wait while we set things up.</p>
+                </div>
+            </div>
+        );
+    }
+
+    if (showLogin) {
+        return (
+            <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-purple-400 to-indigo-600">
+                <div className="bg-white p-8 rounded-lg shadow-xl w-full max-w-md">
+                    <h2 className="text-3xl font-bold text-center text-gray-800 mb-6">Welcome to TaskFlow!</h2>
+                    <p className="text-center text-gray-600 mb-4">
+                        Please enter a username to get started. Your data will be saved anonymously.
+                    </p>
+                    <input
+                        type="text"
+                        placeholder="Choose a username"
+                        className="w-full p-3 mb-4 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        value={username}
+                        onChange={(e) => setUsername(e.target.value)}
+                    />
+                    <button
+                        onClick={handleLoginRegister}
+                        className="w-full bg-purple-600 text-white py-3 rounded-md hover:bg-purple-700 transition duration-300 ease-in-out transform hover:scale-105 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2"
+                    >
+                        Enter
+                    </button>
+                    <p className="text-sm text-gray-500 text-center mt-4">
+                        Your User ID: <span className="font-mono text-xs break-all">{currentUser?.uid || 'Not available'}</span>
+                    </p>
+                </div>
+                <Message message={message} />
+            </div>
+        );
+    }
+
+    const getTasksByStatus = (status) => {
+        return tasks.filter(task => task.status === status);
+    };
+
+    return (
+        <div className="min-h-screen bg-gray-100 font-inter antialiased flex flex-col">
+            <style>
+                {`
+                @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+                body {
+                    font-family: 'Inter', sans-serif;
+                }
+                .custom-scrollbar::-webkit-scrollbar {
+                    width: 8px;
+                }
+                .custom-scrollbar::-webkit-scrollbar-track {
+                    background: #f1f1f1;
+                    border-radius: 10px;
+                }
+                .custom-scrollbar::-webkit-scrollbar-thumb {
+                    background: #888;
+                    border-radius: 10px;
+                }
+                .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+                    background: #555;
+                }
+                `}
+            </style>
+            <header className="bg-white shadow-md py-4 px-6 flex justify-between items-center sticky top-0 z-40">
+                <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-purple-600 to-pink-600">
+                    TaskFlow
+                </h1>
+                <div className="flex items-center space-x-4">
+                    {currentUser && users[currentUser.uid] && (
+                        <span className="text-gray-800 font-medium hidden sm:block">
+                            Welcome, {users[currentUser.uid].username}!
+                        </span>
+                    )}
+                    <div className="relative">
+                        <button
+                            onClick={() => setShowNotifications(!showNotifications)}
+                            className="relative p-2 rounded-full bg-gray-200 hover:bg-gray-300 transition duration-200"
+                        >
+                            <Bell size={20} />
+                            {unreadNotificationCount > 0 && (
+                                <span className="absolute top-0 right-0 inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none text-red-100 bg-red-600 rounded-full">
+                                    {unreadNotificationCount}
+                                </span>
+                            )}
+                        </button>
+                        {showNotifications && (
+                            <div className="absolute right-0 mt-2 w-80 bg-white rounded-lg shadow-xl p-4 z-50 max-h-96 overflow-y-auto custom-scrollbar">
+                                <div className="flex justify-between items-center mb-3 border-b pb-2">
+                                    <h4 className="font-bold text-lg">Notifications</h4>
+                                    <button
+                                        onClick={handleMarkAllNotificationsRead}
+                                        className="text-sm text-blue-500 hover:underline"
+                                    >
+                                        Mark All Read
+                                    </button>
+                                </div>
+                                {notifications.length === 0 ? (
+                                    <p className="text-gray-600 text-sm">No new notifications.</p>
+                                ) : (
+                                    notifications.map(notif => (
+                                        <div key={notif.id} className={`p-3 mb-2 rounded-lg ${notif.read ? 'bg-gray-100 text-gray-600' : 'bg-blue-50 text-gray-800 font-medium'}`}>
+                                            <p className="text-sm">{notif.message}</p>
+                                            <p className="text-xs text-gray-500 mt-1">
+                                                {new Date(notif.createdAt?.toDate()).toLocaleString()}
+                                            </p>
+                                            <button
+                                                onClick={() => handleMarkNotificationRead(notif.id)}
+                                                className="mt-2 text-xs text-purple-500 hover:underline flex items-center"
+                                            >
+                                                {notif.read ? <EyeOff size={14} className="mr-1" /> : <Eye size={14} className="mr-1" />}
+                                                {notif.read ? 'Mark Unread' : 'Mark Read'}
+                                            </button>
+                                        </div>
+                                    ))
+                                )}
+                            </div>
+                        )}
+                    </div>
+                    <button
+                        onClick={handleLogout}
+                        className="bg-red-500 text-white px-4 py-2 rounded-full hover:bg-red-600 transition duration-300 ease-in-out transform hover:scale-105 shadow-md"
+                    >
+                        Logout
+                    </button>
+                </div>
+            </header>
+
+            <main className="flex-grow container mx-auto px-4 py-8 flex flex-col lg:flex-row gap-8">
+                {/* Left Sidebar: Projects List */}
+                <aside className="lg:w-1/4 w-full bg-white p-6 rounded-xl shadow-lg h-fit sticky top-24">
+                    <h2 className="text-2xl font-bold text-gray-800 mb-5 border-b pb-3 flex items-center">
+                        <LayoutDashboard size={24} className="mr-2" /> My Projects
+                    </h2>
+                    <button
+                        onClick={() => setShowCreateProjectModal(true)}
+                        className="w-full bg-blue-600 text-white py-2 rounded-lg mb-4 flex items-center justify-center hover:bg-blue-700 transition duration-300 ease-in-out transform hover:scale-105 shadow-md"
+                    >
+                        <Plus size={20} className="mr-2" /> Create New Project
+                    </button>
+                    <div className="space-y-3">
+                        {projects.length === 0 ? (
+                            <p className="text-gray-600 text-sm text-center">No projects yet.</p>
+                        ) : (
+                            projects.map(project => (
+                                <button
+                                    key={project.id}
+                                    onClick={() => setActiveProject(project)}
+                                    className={`w-full text-left p-3 rounded-lg flex items-center space-x-3 transition duration-200
+                                        ${activeProject?.id === project.id ? 'bg-purple-100 text-purple-800 font-semibold shadow-inner' : 'bg-gray-50 text-gray-700 hover:bg-gray-100'}`}
+                                >
+                                    <Users size={20} className="text-gray-500" />
+                                    <span>{project.name}</span>
+                                </button>
+                            ))
+                        )}
+                    </div>
+                </aside>
+
+                {/* Main Content: Project Board or Welcome */}
+                <section className="lg:w-3/4 w-full">
+                    {!activeProject ? (
+                        <div className="bg-white p-10 rounded-xl shadow-lg text-center h-full flex flex-col items-center justify-center">
+                            <h2 className="text-4xl font-extrabold text-gray-800 mb-4">Select a Project or Create One!</h2>
+                            <p className="text-lg text-gray-600 mb-8">
+                                Get started by choosing an existing project from the left sidebar, or create a brand new one to organize your tasks.
+                            </p>
+                            <button
+                                onClick={() => setShowCreateProjectModal(true)}
+                                className="bg-purple-600 text-white px-8 py-4 rounded-full text-xl font-semibold hover:bg-purple-700 transition duration-300 ease-in-out transform hover:scale-105 shadow-lg"
+                            >
+                                <Plus size={24} className="inline-block mr-3" /> Start a New Project
+                            </button>
+                        </div>
+                    ) : (
+                        <div className="bg-white p-6 rounded-xl shadow-lg">
+                            <div className="flex justify-between items-center mb-6 border-b pb-4">
+                                <div>
+                                    <h2 className="text-3xl font-bold text-gray-800">{activeProject.name}</h2>
+                                    <p className="text-gray-600 mt-1">{activeProject.description}</p>
+                                    <p className="text-sm text-gray-500 mt-2">
+                                        Members: {activeProject.members?.map(memberId => users[memberId]?.username || 'Unknown').join(', ') || 'None'}
+                                    </p>
+                                </div>
+                                <div className="flex space-x-3">
+                                    <button
+                                        onClick={() => setShowCreateTaskModal(true)}
+                                        className="bg-green-600 text-white px-4 py-2 rounded-full flex items-center hover:bg-green-700 transition duration-300 ease-in-out transform hover:scale-105 shadow-md"
+                                    >
+                                        <Plus size={20} className="mr-2" /> Add Task
+                                    </button>
+                                    <button
+                                        onClick={() => setShowInviteMemberModal(true)}
+                                        className="bg-indigo-600 text-white px-4 py-2 rounded-full flex items-center hover:bg-indigo-700 transition duration-300 ease-in-out transform hover:scale-105 shadow-md"
+                                    >
+                                        <Users size={20} className="mr-2" /> Invite Member
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Task Board Columns */}
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                                {['todo', 'in-progress', 'done'].map(status => (
+                                    <div key={status} className="bg-gray-50 p-4 rounded-lg shadow-inner">
+                                        <h3 className={`text-xl font-semibold mb-4 capitalize ${
+                                            status === 'todo' ? 'text-gray-700' :
+                                            status === 'in-progress' ? 'text-blue-700' :
+                                            'text-green-700'
+                                        } flex items-center`}>
+                                            {status === 'todo' && <CircleDot size={20} className="mr-2" />}
+                                            {status === 'in-progress' && <Clock size={20} className="mr-2" />}
+                                            {status === 'done' && <CheckCircle size={20} className="mr-2" />}
+                                            {status.replace('-', ' ')} ({getTasksByStatus(status).length})
+                                        </h3>
+                                        <div className="space-y-3 min-h-[100px]">
+                                            {getTasksByStatus(status).length === 0 ? (
+                                                <p className="text-gray-500 text-sm text-center py-4">No tasks here.</p>
+                                            ) : (
+                                                getTasksByStatus(status).map(task => (
+                                                    <div
+                                                        key={task.id}
+                                                        onClick={() => { setSelectedTask(task); setShowTaskDetailModal(true); }}
+                                                        className="bg-white p-4 rounded-lg shadow-sm border border-gray-200 cursor-pointer hover:shadow-md transition duration-200"
+                                                    >
+                                                        <h4 className="font-semibold text-lg text-gray-900">{task.title}</h4>
+                                                        {task.assignedTo && (
+                                                            <p className="text-sm text-gray-600 flex items-center mt-1">
+                                                                <User size={14} className="mr-1" /> Assigned to: {users[task.assignedTo]?.username || 'Unassigned'}
+                                                            </p>
+                                                        )}
+                                                        {task.dueDate && (
+                                                            <p className="text-xs text-gray-500 flex items-center mt-1">
+                                                                <Clock size={12} className="mr-1" /> Due: {new Date(task.dueDate.toDate()).toLocaleDateString()}
+                                                            </p>
+                                                        )}
+                                                        <p className="text-xs text-blue-500 flex items-center mt-2">
+                                                            <MessageSquare size={12} className="mr-1" /> {comments.filter(c => c.taskId === task.id).length} Comments
+                                                        </p>
+                                                    </div>
+                                                ))
+                                            )}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </section>
+            </main>
+
+            {/* Modals */}
+            {showCreateProjectModal && (
+                <CreateProjectModal
+                    onClose={() => setShowCreateProjectModal(false)}
+                    onCreate={handleCreateProject}
+                />
+            )}
+            {showCreateTaskModal && activeProject && (
+                <CreateTaskModal
+                    onClose={() => setShowCreateTaskModal(false)}
+                    onCreate={handleCreateTask}
+                    projectMembers={activeProject.members || []}
+                />
+            )}
+            {showTaskDetailModal && selectedTask && (
+                <TaskDetailModal
+                    task={selectedTask}
+                    onClose={() => setShowTaskDetailModal(false)}
+                    onAddComment={handleAddComment}
+                    onUpdateStatus={handleUpdateTaskStatus}
+                />
+            )}
+            {showInviteMemberModal && activeProject && (
+                <InviteMemberModal
+                    onClose={() => setShowInviteMemberModal(false)}
+                    onInvite={handleInviteMember}
+                    projectMembers={activeProject.members || []}
+                />
+            )}
+
+            <Message message={message} />
+        </div>
+    );
+};
+
+export default App;
